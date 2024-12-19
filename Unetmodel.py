@@ -9,13 +9,12 @@
 '''
 # here put the import lib
 
-import torch.nn as nn
 import torch
+import torch.nn as nn
 from torch import autograd
 from visualize import make_dot
-from torchsummary import summary
-import hiddenlayer as h1
 import os
+import torch.nn.functional as F
 
 '''
 文件介绍：定义了unet网络模型,
@@ -31,7 +30,7 @@ class DoubleConv(nn.Module):
             nn.Conv2d(in_ch, out_ch, 3, padding=1),          #卷积层          
             nn.BatchNorm2d(out_ch),                          #归一化层
             nn.ReLU(inplace=True),                           #激活层
-            nn.Conv2d(out_ch, out_ch, 1),         #卷积层,文章中描述每层由一个3x3卷积和一个1x1卷积组成，而非标准的双3x3卷积
+            nn.Conv2d(out_ch, out_ch, 1, padding=0),         #卷积层,使用1x1卷积保持尺寸不变
             nn.BatchNorm2d(out_ch),                          #归一化层
             nn.ReLU(inplace=True)                            #激活层
         )
@@ -57,29 +56,29 @@ class Unet(nn.Module):
 
         # 逆卷积，也可以使用上采样(保证k=stride,stride即上采样倍数)
         self.up6 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(512, 256, kernel_size=1)
+            nn.Upsample(size=None, scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(512, 256, kernel_size=1, padding=0)
         )
         self.conv6 = DoubleConv(256, 256)  # 输入通道从512改为256
         
         self.up7 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(256, 128, kernel_size=1)
+            nn.Upsample(size=None, scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(256, 128, kernel_size=1, padding=0)
         )
         self.conv7 = DoubleConv(128, 128)  # 输入通道从256改为128
         
         self.up8 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(128, 64, kernel_size=1)
+            nn.Upsample(size=None, scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(128, 64, kernel_size=1, padding=0)
         )
         self.conv8 = DoubleConv(64, 64)    # 输入通道从128改为64
         
         self.up9 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(64, 32, kernel_size=1)
+            nn.Upsample(size=None, scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(64, 32, kernel_size=1, padding=0)
         )
         self.conv9 = DoubleConv(32, 32)    # 输入通道从64改为32
-        self.conv10 = nn.Conv2d(32, out_ch, 1)
+        self.conv10 = nn.Conv2d(32, out_ch, 1, padding=0)
 
     #定义网络前向传播过程
     def forward(self, x):
@@ -94,53 +93,34 @@ class Unet(nn.Module):
         c5 = self.conv5(p4)
         #上采样
         up_6 = self.up6(c5)
+        # 使用插值来确保尺寸匹配
+        if up_6.size() != c4.size():
+            up_6 = F.interpolate(up_6, size=c4.size()[2:], mode='bilinear', align_corners=True)
         merge6 = up_6 + c4    # 使用加法替代concatenation
         c6 = self.conv6(merge6)
+
         up_7 = self.up7(c6)
+        if up_7.size() != c3.size():
+            up_7 = F.interpolate(up_7, size=c3.size()[2:], mode='bilinear', align_corners=True)
         merge7 = up_7 + c3    # 使用加法替代concatenation
         c7 = self.conv7(merge7)
+
         up_8 = self.up8(c7)
+        if up_8.size() != c2.size():
+            up_8 = F.interpolate(up_8, size=c2.size()[2:], mode='bilinear', align_corners=True)
         merge8 = up_8 + c2    # 使用加法替代concatenation
         c8 = self.conv8(merge8)
+
         up_9 = self.up9(c8)
+        if up_9.size() != c1.size():
+            up_9 = F.interpolate(up_9, size=c1.size()[2:], mode='bilinear', align_corners=True)
         merge9 = up_9 + c1    # 使用加法替代concatenation
         c9 = self.conv9(merge9)
         c10 = self.conv10(c9)
-        out = nn.Sigmoid()(c10)
+        out = torch.sigmoid(c10)
         return out
 
 #创建一个不存在的文件夹
 def  makefilepath(folder_path):   
     if not os.path.exists(folder_path): 
         os.makedirs(folder_path)
-
-if __name__ == '__main__': 
-
-    #[1]显示所有参数
-    myUnet=Unet(1,2)
-    print(myUnet)
-    print("[1] print success!")
-    print("-"*100)
-
-    #[2]hiddenlayer显示pdf文档
-    h1_graph=h1.build_graph(myUnet,torch.zeros([1,1,512,512]))
-    h1_graph.theme=h1.graph.THEMES["blue"].copy()
-    modelimage="./modelimage/"
-    makefilepath(modelimage)
-    h1_graph.save(modelimage+"unet_model_image.png",format="png")
-    print("[2] hiddenlayer show success!")
-    print("-"*100)
-
-    #[3]summary表格模式显示
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    myUnet1 = myUnet.to(device)
-    summary(myUnet1,input_size=(1,512,512))
-    print("[3] summary show success!")
-    print("-"*100)
-
-    #[4]模型PDF模型显示
-    y = myUnet (torch.zeros([1,1,512,512]))
-    g = make_dot(y)
-    g.view()
-    print("[4] make_dot show success!")
-    print("-"*100)

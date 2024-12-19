@@ -1,117 +1,188 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
-'''
-(1)参考文献：UNet网络简单实现
-https://blog.csdn.net/jiangpeng59/article/details/80189889
-
-'''
+import os
 import torch
-import argparse
-from torch.utils.data import DataLoader
 from torch import nn, optim
+from torch.utils.data import DataLoader
 from torchvision.transforms import transforms
-from  Unetmodel import Unet
-from  setdata import LiverDataset
-from  setdata import *
-from  customLoss import *
+from Unetmodel import Unet
+from setdata import LiverDataset
+from customLoss import CustomLoss
+import configparser
+import logging
+from datetime import datetime
 
+# 设置设备
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
-# 是否使用cuda
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-#定义输入数据的预处理模式，因为分为原始图片和研磨图像，所以也分为两种
-#image转换为0~1的数据类型
-x_transforms = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5]) #单通道
-])
+# 设置CUDA内存管理
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()  # 清空CUDA缓存
+    torch.backends.cudnn.benchmark = True  # 使用cudnn自动寻找最适合当前配置的高效算法
+    # 设置较小的网络权重数据类型，以减少内存使用
+    torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
-# 此处提供的mask图像是单通道图像，所以mask只需要转换为tensor
-y_transforms = transforms.ToTensor()
+# 设置日志
+def setup_logger(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
 
-#model:模型       criterion：损失函数     optimizer：优化器
-#dataload：数据   num_epochs：训练轮数
-def train_model(model, criterion, optimizer, dataload, num_epochs=5):
+# 数据预处理
+x_transforms = None  # EXR图像的四个通道已经在read_exr中归一化
+y_transforms = None  # GT已经在Dataset中被转换为tensor并归一化
+
+def train_model(model, criterion, optimizer, train_loader, val_loader, config):
+    num_epochs = int(config.get('base', 'epochs'))
+    save_frequency = int(config.get('base', 'save_frequency'))
+    best_val_loss = float('inf')
+    
     for epoch in range(num_epochs):
-        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
-        print('-' * 10)
-        dt_size = len(dataload.dataset)
-        epoch_loss = 0
-        step = 0
-        for x, y in dataload:
-            step += 1
+        logging.info(f'Epoch {epoch}/{num_epochs - 1}')
+        logging.info('-' * 10)
+        
+        # 训练阶段
+        model.train()
+        train_loss = 0
+        for step, (inputs, labels) in enumerate(train_loader):
+            # 检查输入维度
+            if inputs.size(1) != 4:
+                logging.error(f"输入通道数错误：期望4通道，实际{inputs.size(1)}通道")
+                continue
+                
+            if labels.size(1) != 1:
+                logging.error(f"标签通道数错误：期望1通道，实际{labels.size(1)}通道")
+                continue
+            
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            
+            try:
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels, inputs)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                if step % 10 == 0:
+                    logging.info(f'Step {step} - Train Loss: {loss.item():.4f}')
+                    
+            except RuntimeError as e:
+                logging.error(f"训练步骤出错: {str(e)}")
+                continue
+                
+            # 清理不需要的缓存
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, labels, inputs)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        logging.info(f'Epoch {epoch} - Avg Train Loss: {avg_train_loss:.4f}, Avg Val Loss: {avg_val_loss:.4f}')
+        
+        # 保存模型
+        if epoch % save_frequency == 0:
+            torch.save(model.state_dict(), os.path.join('checkpoints', f'pcss_model_epoch_{epoch}.pth'))
+        
+        # 保存最佳模型
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), config.get('base', 'best_model_path'))
+            logging.info(f'Saved new best model with validation loss: {best_val_loss:.4f}')
 
-            #判断是否调用GPU
-            inputs = x.to(device)
-            labels = y.to(device)
-
-            # zero the parameter gradients
-            optimizer.zero_grad()
-            # forward
-            outputs = model(inputs)
-            loss = criterion(outputs, labels, inputs) #计算损失值
-            loss.backward()
-            optimizer.step()#更新所有的参数
-
-            #item（）是得到一个元素张量里面的元素值
-            epoch_loss += loss.item()
-            print("%d/%d,train_loss:%0.3f" % (step, (dt_size - 1) // dataload.batch_size + 1, loss.item()))
-        print("epoch %d loss:%0.3f" % (epoch, epoch_loss/step))
-    #保存模型
-    torch.save(model.state_dict(), 'weights_%d.pth' % epoch)
-    return model
-
-#训练模型函数
-def train(batch_size,train_path):
-    #模型初始化
-    model = Unet(4, 1).to(device)
-    batch_size = batch_size
-    #定义损失函数
-    criterion = CustomLoss(alpha=0.9, p=3)
-    #定义优化器
-    optimizer = optim.Adam(model.parameters())
-    #加载训练数据
-    liver_dataset = LiverDataset(train_path,transform=x_transforms,target_transform=y_transforms)
-    dataloaders = DataLoader(liver_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    train_model(model, criterion, optimizer, dataloaders)
-
-#模型的测试结果
-def test(ckptpath,val_path):
-    #输入三通道，输出单通道
-    model = Unet(4, 1)
-    model.load_state_dict(torch.load(ckptpath,map_location='cpu'))
-    liver_dataset = LiverDataset(val_path, transform=x_transforms,target_transform=y_transforms)
-    #一次加载一张图像
-    dataloaders = DataLoader(liver_dataset, batch_size=1)
-    #eval函数是将字符串转化为list、dict、tuple，但是字符串里的字符必须是标准的格式，不然会出错
-    model.eval()
-
-    import matplotlib.pyplot as plt
-    plt.ion()# 打开交互模式
-    with torch.no_grad():
-        for x, _ in dataloaders:
-            y=model(x).sigmoid()
-            #a.squeeze(i)   压缩第i维，如果这一维维数是1，则这一维可有可无，便可以压缩
-            img_y=torch.squeeze(y).numpy()
-            plt.imshow(img_y, cmap='gray')
-            plt.pause(0.01)
-        plt.show()
-
-
-
-if __name__ == '__main__':
-
-    #载入配置模块并调用基础设置节点
-    import configparser 
+def main():
+    # 读取配置文件
     config = configparser.ConfigParser()
     config.read("config.ini", encoding="utf-8")
-    config.sections()                               # 获取section节点 
-    config.options('base')                          # 获取指定section 的options即该节点的所有键 
-    batchsize=config.get("base", "batchsize")       # 获取指定base下的batchsize
-    ckptpath=config.get("base", "ckptpath")         # 获取指定base下的ckptpath
-    train_path=config.get("base", "train_path")     # 获取指定base下的train_path
-    val_path=config.get("base", "val_path")         # 获取指定base下的val_path
+    
+    # 创建必要的目录
+    os.makedirs("./checkpoints", exist_ok=True)
+    os.makedirs("./data/train", exist_ok=True)
+    os.makedirs("./data/val", exist_ok=True)
+    os.makedirs(config.get('base', 'log_dir'), exist_ok=True)
+    
+    # 设置日志
+    setup_logger(config.get('base', 'log_dir'))
+    
+    # 设置设备内存限制
+    if torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(0.8)  # 限制GPU内存使用为80%
+    
+    # 初始化模型
+    input_channels = int(config.get('base', 'input_channels'))
+    output_channels = int(config.get('base', 'output_channels'))
+    model = Unet(input_channels, output_channels).to(device)
+    
+    # 定义损失函数和优化器
+    criterion = CustomLoss(
+        alpha=float(config.get('base', 'alpha')),
+        p=int(config.get('base', 'p'))
+    )
+    learning_rate = float(config.get('base', 'learning_rate'))
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # 准备数据加载器
+    batch_size = int(config.get('base', 'batchsize'))
+    train_dataset = LiverDataset(
+        config.get('base', 'train_path'),
+        transform=x_transforms,
+        target_transform=y_transforms
+    )
+    val_dataset = LiverDataset(
+        config.get('base', 'val_path'),
+        transform=x_transforms,
+        target_transform=y_transforms
+    )
+    
+    # 设置生成器
+    g = None
+    if torch.cuda.is_available():
+        g = torch.Generator(device=device)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        generator=g
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        generator=g
+    )
+    
+    # 开始训练
+    logging.info("Starting training...")
+    train_model(model, criterion, optimizer, train_loader, val_loader, config)
+    logging.info("Training completed!")
 
-    train(batchsize,train_path)                     # 训练
-    test(ckptpath,val_path)                         # 测试
+if __name__ == "__main__":
+    main()

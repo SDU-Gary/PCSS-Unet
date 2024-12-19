@@ -1,0 +1,35 @@
+# Ignore checkpoints directory
+checkpoints/
+
+# Ignore data directory and zip file
+data/
+data.zip
+
+# Ignore logs directory
+logs/
+
+# Ignore outputs directory
+outputs/
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE settings
+.vscode/
+.idea/
+
+# Environment
+.env
+venv/
+env/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
