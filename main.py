@@ -111,8 +111,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     global_step = 0
     
     # 记录模型结构
-    dummy_input = torch.randn(1, 4, 256, 256).to(device)
-    writer.add_graph(model, dummy_input)
+    # dummy_input = torch.randn(1, 4, 256, 256).to(device)
+    # writer.add_graph(model, dummy_input)
     
     try:
         for epoch in range(num_epochs):
@@ -341,8 +341,7 @@ def main():
     
     # 定义损失函数和优化器
     criterion = CustomLoss(
-        alpha=float(config.get('base', 'alpha')),
-        p=int(config.get('base', 'p'))
+        alpha=float(config.get('base', 'alpha'))
     ).to(device)
     
     learning_rate = float(config.get('base', 'learning_rate'))
