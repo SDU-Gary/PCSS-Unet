@@ -3,8 +3,7 @@
 
 from torch.utils.data import Dataset
 import torch
-import OpenEXR
-import Imath
+import cv2
 import numpy as np
 import os
 import PIL.Image as Image
@@ -12,6 +11,15 @@ from torchvision import transforms
 import logging
 import sys
 import traceback
+import OpenEXR
+import Imath
+import gc
+
+# 禁用PIL的调试输出
+import PIL
+PIL.Image.init()
+PIL.Image.PILLOW_VERSION = PIL.__version__  # 兼容性设置
+logging.getLogger('PIL').setLevel(logging.WARNING)  # 将PIL的日志级别设置为WARNING
 
 # 配置日志记录
 logging.basicConfig(
@@ -40,21 +48,33 @@ def read_exr(exr_path):
         logging.debug(f"EXR文件尺寸: {size}")
 
         FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-        normalized_channels = []
         
-        for channel_name in ["R", "G", "B", "A"]:
-            logging.debug(f"正在读取通道: {channel_name}")
+        # 预先检查所有通道是否存在
+        available_channels = file.header()['channels'].keys()
+        logging.debug(f"可用通道: {available_channels}")
+        
+        # 一次性读取所有通道
+        channels = ["R", "G", "B", "A"]
+        channel_data = file.channels(channels, FLOAT)
+        
+        normalized_channels = []
+        for i, channel_name in enumerate(channels):
             try:
-                channel_str = file.channel(channel_name, FLOAT)
-                if channel_str is None:
-                    raise ValueError(f"通道 {channel_name} 为空")
+                if channel_data[i] is None:
+                    if channel_name == "A":
+                        # 如果是Alpha通道不存在，创建全1的通道
+                        arr = np.ones(size, dtype=np.float32)
+                        logging.debug(f"创建默认Alpha通道: shape={size}")
+                    else:
+                        raise ValueError(f"通道 {channel_name} 数据为空")
+                else:
+                    # 安全地创建numpy数组
+                    arr = np.frombuffer(channel_data[i], dtype=np.float32)
+                    if arr is None or arr.size == 0:
+                        raise ValueError(f"通道 {channel_name} 数据为空")
+                        
+                    arr = arr.reshape(size)
                     
-                # 安全地创建numpy数组
-                arr = np.frombuffer(channel_str, dtype=np.float32)
-                if arr is None or arr.size == 0:
-                    raise ValueError(f"通道 {channel_name} 数据为空")
-                    
-                arr = arr.reshape(size)
                 logging.debug(f"通道 {channel_name} 形状: {arr.shape}")
                 
                 # 检查数值范围
@@ -62,7 +82,6 @@ def read_exr(exr_path):
                     logging.warning(f"通道 {channel_name} 包含无效值")
                     arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
                 
-                # 移除归一化步骤，直接使用原始值
                 logging.debug(f"通道 {channel_name} 范围: [{np.min(arr)}, {np.max(arr)}]")
                 normalized_channels.append(arr.copy())
                 
@@ -129,92 +148,112 @@ class LiverDataset(Dataset):
         self.target_transform = target_transform
         self.root = root
         
-        # 禁用缓存以减少内存使用
-        self.cache = None
-
-    def _load_data(self, index):
-        """实际加载数据的方法"""
+    def _load_data(self, input_path, label_path):
         try:
-            input_path, gt_path = self.imgs[index]
-            
-            # 验证文件存在
-            if not os.path.exists(input_path) or not os.path.exists(gt_path):
-                raise FileNotFoundError(f"输入或GT文件不存在: {input_path}, {gt_path}")
-            
             # 读取输入EXR文件
-            try:
-                input_channels = read_exr(input_path)
-                if not input_channels or len(input_channels) != 4:
-                    raise ValueError(f"无效的EXR数据")
-                    
-                # 转换为tensor并立即释放numpy数组
-                tensors = []
-                for channel in input_channels:
-                    tensor = torch.from_numpy(channel.copy())
-                    tensors.append(tensor)
-                    del channel
-                x = torch.stack(tensors, dim=0)
-                del tensors
-                del input_channels
-                
-            except Exception as e:
-                raise IOError(f"读取EXR文件时出错: {str(e)}")
+            input_channels = read_exr(input_path)
             
-            # 读取GT PNG文件
-            try:
-                with Image.open(gt_path) as img:
-                    # 转换为灰度图并保持原始值
-                    img_gray = img.convert('L')
-                    y = torch.from_numpy(np.array(img_gray)).unsqueeze(0).float()
-                    if not torch.isfinite(y).all():
-                        y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0)
-            except Exception as e:
-                raise IOError(f"读取GT文件时出错: {str(e)}")
+            # 将通道数组转换为tensor
+            input_tensor = torch.stack([torch.from_numpy(channel) for channel in input_channels], dim=0)
+            input_tensor = input_tensor.float()  # 确保是float类型
+            input_tensor = input_tensor.requires_grad_(True)  # 确保需要梯度
+            input_size = input_tensor.shape[-2:]  # 获取高度和宽度
+            logging.debug(f"输入tensor尺寸: {input_tensor.shape}")
             
-            # 验证数据维度
-            if x.dim() != 3 or x.size(0) != 4:
-                raise ValueError(f"无效的输入tensor形状")
-            if y.dim() != 3 or y.size(0) != 1:
-                raise ValueError(f"无效的GT tensor形状")
+            # 读取标签图像
+            label = Image.open(label_path).convert('L')
+            # 调整标签图像大小以匹配输入
+            label = label.resize((input_size[1], input_size[0]), Image.NEAREST)
+            label_array = np.array(label) / 255.0# 归一化到[0,1]
+            label_tensor = torch.from_numpy(label_array).float().unsqueeze(0)  # 添加通道维度
+            median_value = torch.median(label_tensor)
+            mean_value = torch.mean(label_tensor)
+            logging.debug(f"标签图像范围：{label_tensor.min()} - {label_tensor.max()}")
+            logging.debug(f"标签图像均值：{mean_value.item()}   标签图像中位数：{median_value.item()}")
+            logging.debug(f"标签tensor尺寸: {label_tensor.shape}")
             
-            # 确保数据类型正确
-            x = x.float()
-            y = y.float()
+            # 验证尺寸匹配
+            if input_tensor.shape[-2:] != label_tensor.shape[-2:]:
+                raise ValueError(f"输入 ({input_tensor.shape}) 和标签 ({label_tensor.shape}) 尺寸不匹配")
             
-            # 验证数值范围
-            if not torch.isfinite(x).all():
-                x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
+            # 应用变换
+            if self.transform is not None:
+                input_tensor = self.transform(input_tensor)
+            if self.target_transform is not None:
+                label_tensor = self.target_transform(label_tensor)
             
-            return x, y
+            # 最终验证
+            if input_tensor.shape[-2:] != label_tensor.shape[-2:]:
+                raise ValueError(f"变换后输入 ({input_tensor.shape}) 和标签 ({label_tensor.shape}) 尺寸不匹配")
+            
+            # 确保张量在正确的设备上并且可以计算梯度
+            input_tensor = input_tensor.detach().clone()
+            input_tensor.requires_grad_(True)  # 明确设置requires_grad
+            label_tensor = label_tensor.detach().clone()
+            
+            return input_tensor, label_tensor
             
         except Exception as e:
             logging.error(f"加载数据时出错: {str(e)}")
-            logging.error(traceback.format_exc())
-            # 返回一个空张量对而不是抛出异常
-            return torch.zeros((4, 512, 512), dtype=torch.float32), torch.zeros((1, 512, 512), dtype=torch.float32)
-
+            raise IOError(f"读取文件时出错: {str(e)}")
+    
     def __getitem__(self, index):
-        try:
-            x, y = self._load_data(index)
-            
-            if self.transform:
-                x = self.transform(x)
-            if self.target_transform:
-                y = self.target_transform(y)
-            
-            # 最后的安全检查
-            if not (torch.isfinite(x).all() and torch.isfinite(y).all()):
-                logging.warning(f"发现无效值")
-                x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0)
-                y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=0.0)
-            
-            return x, y
-            
-        except Exception as e:
-            logging.error(f"获取数据时出错: {str(e)}")
-            logging.error(traceback.format_exc())
-            # 返回一个空张量对而不是抛出异常
-            return torch.zeros((4, 512, 512), dtype=torch.float32), torch.zeros((1, 512, 512), dtype=torch.float32)
-
+        input_path, label_path = self.imgs[index]
+        return self._load_data(input_path, label_path)
+        
     def __len__(self):
         return len(self.imgs)
+
+class MmapLiverDataset(Dataset):
+    """使用内存映射的数据集实现"""
+    def __init__(self, data_dir, transform=None, target_transform=None):
+        """
+        Args:
+            data_dir: 包含inputs.npy和labels.npy的目录路径
+            transform: 输入数据的转换
+            target_transform: 标签数据的转换
+        """
+        self.inputs_path = os.path.join(data_dir, 'inputs.npy')
+        self.labels_path = os.path.join(data_dir, 'labels.npy')
+        
+        if not os.path.exists(self.inputs_path) or not os.path.exists(self.labels_path):
+            raise FileNotFoundError(f"数据文件不存在。请先运行prepare_dataset.py处理数据。")
+            
+        # 使用内存映射模式加载数据
+        self.inputs = np.load(self.inputs_path, mmap_mode='r')
+        self.labels = np.load(self.labels_path, mmap_mode='r')
+        
+        if self.inputs.shape[0] != self.labels.shape[0]:
+            raise ValueError(f"输入数据和标签数量不匹配: {self.inputs.shape[0]} vs {self.labels.shape[0]}")
+            
+        self.transform = transform
+        self.target_transform = target_transform
+        
+        logging.info(f"使用内存映射加载数据集:")
+        logging.info(f"输入形状: {self.inputs.shape}")
+        logging.info(f"标签形状: {self.labels.shape}")
+        
+    def __getitem__(self, index):
+        """获取一个数据样本"""
+        # 从内存映射数组中读取数据
+        input_array = self.inputs[index].astype(np.float32)
+        label_array = self.labels[index].astype(np.float32)
+        
+        # 转换为tensor
+        input_tensor = torch.from_numpy(input_array)
+        label_tensor = torch.from_numpy(label_array)
+        
+        # 应用变换
+        if self.transform is not None:
+            input_tensor = self.transform(input_tensor)
+        if self.target_transform is not None:
+            label_tensor = self.target_transform(label_tensor)
+        
+        # 确保需要梯度
+        input_tensor = input_tensor.detach().clone()
+        input_tensor.requires_grad_(True)
+        
+        return input_tensor, label_tensor
+        
+    def __len__(self):
+        return len(self.inputs)
