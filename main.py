@@ -240,7 +240,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     # 为相关层注册钩子
     hooks = []
     for name, layer in model.named_modules():
-        if isinstance(layer, (nn.Conv2d, nn.InstanceNorm2d, nn.AvgPool2d)):
+        if isinstance(layer, (nn.Conv2d, nn.BatchNorm2d, nn.AvgPool2d)):
             hook = layer.register_full_backward_hook(grad_hook)
             hooks.append(hook)
             logging.info(f"已为层 {name} ({layer.__class__.__name__}) 注册梯度监控钩子")
@@ -278,9 +278,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                     
                     optimizer.zero_grad(set_to_none=True)
                     
-                    with torch.amp.autocast('cuda', 
-                                        dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16, 
-                                        enabled=True):
+                    with torch.amp.autocast(device_type=device.type, 
+                                     dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16, 
+                                     enabled=True):
                         inputs = inputs.to(device, non_blocking=True)
                         labels = labels.to(device, non_blocking=True)
                         
@@ -353,8 +353,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                         outputs_vis = outputs[0:1]
                         labels_vis = labels[0:1]
                         
+                        # 保存时应该统一处理成与infer.py相同的格式
                         writer.add_images('Images/Prediction', outputs_vis, global_step, dataformats='NCHW')
                         writer.add_images('Images/Ground_Truth', labels_vis, global_step, dataformats='NCHW')
+                        
+                        # 同时保存一份应用缩放后的图像与推理脚本一致
+                        outputs_vis_uint8 = (outputs_vis.detach().cpu() * 255).to(torch.uint8)
+                        labels_vis_uint8 = (labels_vis.detach().cpu() * 255).to(torch.uint8)
+                        writer.add_images('Images/Prediction_Uint8', outputs_vis_uint8, global_step, dataformats='NCHW')
+                        writer.add_images('Images/Ground_Truth_Uint8', labels_vis_uint8, global_step, dataformats='NCHW')
                         
                         diff = torch.abs(outputs_vis - labels_vis)
                         writer.add_images('Images/Prediction_Diff', diff, global_step, dataformats='NCHW')
@@ -495,6 +502,7 @@ def validate_with_chunks(model, val_loader, criterion, device, chunk_size=256):
             try:
                 # 分块处理大分辨率图像
                 chunk_loss = 0.0
+                chunk_l1_loss = 0.0
                 chunks = max(1, min(val_inputs.shape[2] // chunk_size, val_inputs.shape[3] // chunk_size))
                 
                 for i in range(chunks):
@@ -507,26 +515,33 @@ def validate_with_chunks(model, val_loader, criterion, device, chunk_size=256):
                         chunk_in = val_inputs[:, :, h_start:h_end, w_start:w_end].to(device, non_blocking=True)
                         chunk_label = val_labels[:, :, h_start:h_end, w_start:w_end].to(device, non_blocking=True)
                         
-                        with torch.amp.autocast('cuda', 
+                        with torch.amp.autocast(device_type=device.type, 
                                             dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16, 
                                             enabled=True): 
                             chunk_out = model(chunk_in)
                             loss = criterion(chunk_out, chunk_label, chunk_in)
+                            l1_loss = criterion.l1(chunk_out, chunk_label)
                         
                         # 立即转移数据到CPU并释放内存
                         chunk_loss += loss.detach().cpu().item()
-                        del chunk_in, chunk_label, chunk_out, loss
+                        chunk_l1_loss += l1_loss.detach().cpu().item()
+                        del chunk_in, chunk_label, chunk_out, loss, l1_loss
                         torch.cuda.empty_cache()
                 
                 # 计算平均损失
                 val_loss += chunk_loss / (chunks * chunks)
+                val_l1_loss += chunk_l1_loss / (chunks * chunks)
                 val_batch_count += 1
                 
             except Exception as e:
                 logging.error(f"验证时出错: {str(e)}")
                 continue
     
-    return val_loss / val_batch_count if val_batch_count > 0 else float('inf')
+    avg_val_loss = val_loss / val_batch_count if val_batch_count > 0 else float('inf')
+    avg_val_l1_loss = val_l1_loss / val_batch_count if val_batch_count > 0 else float('inf')
+    
+    logging.info(f"验证结果 - 总损失: {avg_val_loss:.4f}, L1损失: {avg_val_l1_loss:.4f}")
+    return avg_val_loss
 
 def estimate_memory_usage(model, image_size, batch_size, is_training=True, optimizer_type='adam'):
     """精确显存估算函数

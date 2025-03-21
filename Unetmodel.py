@@ -19,14 +19,12 @@ class DoubleConv(nn.Module):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1),
-            nn.InstanceNorm2d(in_ch),  # 使用实例归一化
+            nn.BatchNorm2d(in_ch, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True),  # 使用BatchNorm替代InstanceNorm
             nn.LeakyReLU(0.2, inplace=False),
             
             nn.Conv2d(in_ch, out_ch, 1),  # 1x1卷积改变通道数
-            nn.InstanceNorm2d(out_ch),
+            nn.BatchNorm2d(out_ch, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True),
             nn.LeakyReLU(0.2, inplace=False),
-            
-            # nn.Dropout2d(0.1)  # 添加Dropout防止梯度消失
         )
 
     def forward(self, x):
@@ -96,6 +94,8 @@ class Unet(nn.Module):
             W = W - (W % 2)
             x = F.interpolate(x, (H, W), mode='bilinear', align_corners=True)
 
+        # 确保数据类型一致
+        x = x.to(torch.float32)
         x = self.rearrange_to_channels(x)
         
         # 编码器部分（从第二层开始）

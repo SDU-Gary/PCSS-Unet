@@ -16,9 +16,16 @@ class VGGLoss(nn.Module):
         """将阴影信息融合到RGB生成3通道"""
         rgb = x[:, :3]  # [B,3,H,W]
         shadow = x[:, 3:]  # [B,1,H,W]
+        # 确保数据类型一致
+        shadow = shadow.to(rgb.dtype)
         return rgb * (1 - shadow)  # 阴影区域变暗
 
     def forward(self, output, target, inputs):
+        # 确保输入类型一致
+        output = output.to(torch.float32)
+        target = target.to(torch.float32)
+        inputs = inputs.to(torch.float32)
+        
         # 预处理（生成3通道）
         output_rgb = self.preprocess_vgg(torch.cat([inputs[:, :3], output], dim=1))
         target_rgb = self.preprocess_vgg(torch.cat([inputs[:, :3], target], dim=1))
