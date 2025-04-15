@@ -4,6 +4,10 @@
 import os
 import ctypes
 import logging
+import argparse
+import math
+from torch.utils.tensorboard import SummaryWriter
+import traceback
 
 # Windows内存优化设置
 if os.name == 'nt':
@@ -32,7 +36,6 @@ import torch.cuda.amp as amp
 import gc
 import numpy as np
 import random
-from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from contextlib import nullcontext
 import time
@@ -135,7 +138,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     # 检查GPU显存
     batch_size = train_loader.batch_size if train_loader else 1
-    image_size = (4, 512, 512)  # 根据实际输入调整
+    image_size = (4, 1024, 2048)  # 调整为实际输入尺寸2048×1024
     if not check_gpu_memory(model, batch_size, image_size, 
                           optimizer_type=optimizer.__class__.__name__.lower()):
         logging.error("GPU显存不足，无法开始训练")
@@ -173,77 +176,50 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     best_loss = float('inf')  # 使用训练损失或验证损失的最佳值
     global_step = 0
     
-    # 定义梯度监控钩子
+    # 定义梯度监控钩子 - 修改为不改变梯度值，只监控并记录
     def grad_hook(module, grad_input, grad_output):
-        """实时梯度监控钩子"""
-        def process_gradient(grad):
-            if grad is None:
-                return None
-                
-            # 创建梯度的深度副本
-            processed_grad = grad.detach().clone()
-            
-            # 检查并记录梯度统计信息
-            if torch.isnan(processed_grad).any() or torch.isinf(processed_grad).any():
-                with torch.no_grad():
-                    grad_stats = {
-                        'mean': processed_grad.abs().mean().item() if not torch.isnan(processed_grad.abs().mean()) else 'NaN',
-                        'max': processed_grad.abs().max().item() if not torch.isnan(processed_grad.abs().max()) else 'NaN',
-                        'min': processed_grad.abs().min().item() if not torch.isnan(processed_grad.abs().min()) else 'NaN',
-                        'std': processed_grad.std().item() if not torch.isnan(processed_grad.std()) else 'NaN'
-                    }
-                    logging.error(f"在模块 {module.__class__.__name__} 中检测到非法梯度值:")
-                    logging.error(f"梯度统计: {grad_stats}")
-            
-            with torch.no_grad():
-                # 处理NaN
-                mask_nan = torch.isnan(processed_grad)
-                if mask_nan.any():
-                    processed_grad = torch.where(mask_nan, torch.zeros_like(processed_grad), processed_grad)
-                    logging.warning(f"模块 {module.__class__.__name__} 中的NaN梯度已替换为0")
-                
-                # 处理Inf
-                mask_inf = torch.isinf(processed_grad)
-                if mask_inf.any():
-                    max_val = 1e4
-                    processed_grad = torch.clamp(
-                        torch.where(mask_inf, torch.sign(processed_grad) * max_val, processed_grad),
-                        -max_val, max_val
-                    )
-                    logging.warning(f"模块 {module.__class__.__name__} 中的Inf梯度已裁剪到[-{max_val}, {max_val}]范围内")
-                
-                # 检查梯度范数并缩放
-                grad_norm = torch.norm(processed_grad)
-                if grad_norm > 1e4:
-                    scale_factor = 1e4 / grad_norm
-                    processed_grad = processed_grad * scale_factor
-                    logging.info(f"模块 {module.__class__.__name__} 的梯度已缩放，范数从 {grad_norm:.2f} 降至 1e4")
-            
-            return processed_grad
-
+        """实时梯度监控钩子 - 只监控不修改梯度"""
         try:
-            # 处理所有输入梯度
-            processed_grads = tuple(process_gradient(g) for g in grad_input)
-            
-            # 验证处理后的梯度
-            for g in processed_grads:
-                if g is not None and (torch.isnan(g).any() or torch.isinf(g).any()):
-                    logging.error(f"模块 {module.__class__.__name__} 的梯度处理失败，仍存在非法值")
-                    return grad_input  # 如果处理失败，返回原始梯度
-            
-            return processed_grads
-            
+            for i, grad in enumerate(grad_input):
+                if grad is None:
+                    continue
+                    
+                # 检查并记录梯度统计信息
+                if torch.isnan(grad).any():
+                    logging.error(f"在模块 {module.__class__.__name__} 中检测到NaN梯度")
+                elif torch.isinf(grad).any():
+                    logging.error(f"在模块 {module.__class__.__name__} 中检测到Inf梯度")
+                
+                # 记录梯度范数信息
+                with torch.no_grad():
+                    try:
+                        grad_norm = torch.norm(grad)
+                        if grad_norm > 1e3:
+                            logging.warning(f"模块 {module.__class__.__name__} 梯度范数过大: {grad_norm:.2f}")
+                    except:
+                        pass
         except Exception as e:
-            logging.error(f"梯度钩子中发生错误: {str(e)}")
-            return grad_input  # 发生错误时返回原始梯度
+            logging.error(f"梯度监控钩子错误: {str(e)}")
+            
+        # 返回原始梯度，不做修改
+        return grad_input
 
-    # 为相关层注册钩子
+    # 为所有层注册钩子 - 扩大注册范围
     hooks = []
     for name, layer in model.named_modules():
-        if isinstance(layer, (nn.Conv2d, nn.BatchNorm2d, nn.AvgPool2d)):
+        if not isinstance(layer, nn.ModuleList) and not isinstance(layer, nn.Sequential) and not isinstance(layer, Unet):
             hook = layer.register_full_backward_hook(grad_hook)
             hooks.append(hook)
-            logging.info(f"已为层 {name} ({layer.__class__.__name__}) 注册梯度监控钩子")
+            
+    # 如果使用增强损失函数，也为其注册钩子
+    if hasattr(criterion, 'perturbation_loss'):
+        for name, module in criterion.named_modules():
+            if hasattr(module, 'parameters') and not isinstance(module, nn.ModuleList) and not isinstance(module, nn.Sequential):
+                hook = module.register_full_backward_hook(grad_hook)
+                hooks.append(hook)
+        logging.info(f"已为损失函数注册梯度监控钩子")
+
+    logging.info(f"总共为 {len(hooks)} 个模块注册了梯度监控钩子")
     
     try:
         for epoch in range(num_epochs):
@@ -285,57 +261,172 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                         labels = labels.to(device, non_blocking=True)
                         
                         outputs = model(inputs)
-                        loss = criterion(outputs, labels, inputs)
                         
-                        l1_loss = criterion.l1(outputs, labels)
-                        vgg_loss = (loss - criterion.alpha * l1_loss) / (1 - criterion.alpha)
+                        if hasattr(criterion, 'perturbation_loss'):
+                            # 使用的是EnhancedCustomLoss
+                            loss, loss_components = criterion(model, outputs, labels, inputs)
+                            
+                            l1_loss = loss_components['l1_loss']
+                            vgg_loss = loss_components['vgg_loss']
+                            perturbation_loss = loss_components['perturbation_loss']
+                        else:
+                            # 使用的是CustomLoss
+                            loss = criterion(outputs, labels, inputs)
+                            
+                            l1_loss = criterion.l1(outputs, labels)
+                            vgg_loss = (loss - criterion.alpha * l1_loss) / (1 - criterion.alpha)
+                            perturbation_loss = torch.tensor(0.0, device=device)
                     
                     # 使用scaler来缩放损失和反向传播
                     scaler.scale(loss).backward(retain_graph=False)
                     
+                    # 梯度处理和裁剪流程
                     try:
-                        # 在scaler.step之前执行梯度检查
-                        if scaler.is_enabled():
-                            # 检查缩放后的梯度
-                            unscaled_grads = []
+                        # 在优化器步骤前取消梯度缩放 - 确保只调用一次unscale_
+                        # 检查梯度
+                        valid_gradients = True
+                        
+                        # 先检查梯度是否包含NaN或Inf，不需要unscale
+                        scaled_grads_have_inf_or_nan = False
+                        has_severe_gradients = False
+                        has_fixable_gradients = False
+                        
+                        # 第一阶段：检测是否存在无效梯度
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                nan_mask = torch.isnan(param.grad)
+                                inf_mask = torch.isinf(param.grad)
+                                
+                                if nan_mask.any() or inf_mask.any():
+                                    scaled_grads_have_inf_or_nan = True
+                                    # 记录无效梯度比例
+                                    invalid_ratio = (nan_mask.sum() + inf_mask.sum()).item() / param.grad.numel()
+                                    
+                                    # 如果无效值比例超过20%，认为这是严重问题
+                                    if invalid_ratio > 0.2:
+                                        has_severe_gradients = True
+                                        logging.error(f"参数 {name} 中存在大量NaN或Inf梯度（{invalid_ratio*100:.1f}%），已跳过本批次更新")
+                                        break
+                                    else:
+                                        has_fixable_gradients = True
+                                        logging.warning(f"参数 {name} 中存在少量NaN或Inf梯度（{invalid_ratio*100:.1f}%），尝试修复")
+                        
+                        # 第二阶段：对于严重问题，直接跳过批次
+                        if has_severe_gradients:
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        
+                        # 第三阶段：修复处理可修复的梯度问题
+                        if has_fixable_gradients:
+                            for name, param in model.named_parameters():
+                                if param.grad is not None:
+                                    grad_data = param.grad.data
+                                    
+                                    # 获取当前参数的有效梯度统计信息
+                                    valid_mask = ~(torch.isnan(grad_data) | torch.isinf(grad_data))
+                                    if valid_mask.sum() > 0:  # 确保有有效梯度
+                                        valid_grads = grad_data[valid_mask]
+                                        valid_mean = valid_grads.mean().item()
+                                        valid_std = valid_grads.std().item() if valid_grads.numel() > 1 else 0.01
+                                        
+                                        # 将NaN替换为当前参数有效梯度的均值
+                                        nan_mask = torch.isnan(grad_data)
+                                        if nan_mask.any():
+                                            # 加入少量噪声避免完全相同的值
+                                            noise = torch.randn_like(grad_data[nan_mask]) * valid_std * 0.1
+                                            grad_data[nan_mask] = valid_mean + noise
+                                            
+                                        # 将Inf替换为当前参数有效梯度的最大值的有符号倍数
+                                        inf_mask = torch.isinf(grad_data)
+                                        if inf_mask.any():
+                                            max_valid = valid_grads.abs().max().item()
+                                            sign_tensor = torch.sign(grad_data[inf_mask])
+                                            # 使用有效梯度最大值的10倍(有符号)
+                                            replacement = sign_tensor * max_valid * 10.0
+                                            grad_data[inf_mask] = replacement
+                                    else:
+                                        # 如果没有有效梯度，则将所有梯度设为0
+                                        grad_data.zero_()
+                                        
+                                    # 统计修复后的梯度分布
+                                    if torch.isnan(grad_data).any() or torch.isinf(grad_data).any():
+                                        logging.error(f"参数 {name} 的梯度修复失败，设置为零")
+                                        grad_data.zero_()
+                        
+                        # 如果训练进行到后期（超过一半epoch），则进一步降低梯度裁剪阈值，防止后期不稳定
+                        current_epoch_ratio = epoch / num_epochs
+                        max_norm = 1.0 if current_epoch_ratio < 0.5 else max(0.1, 1.0 - current_epoch_ratio)
+                        
+                        # 预先对梯度进行裁剪（在取消缩放前），这有助于防止取消缩放后的梯度爆炸
+                        scale = scaler.get_scale()
+                        if math.isfinite(scale):  # 使用math.isfinite而不是torch.isfinite
                             for param in model.parameters():
                                 if param.grad is not None:
-                                    unscaled_grads.append(param.grad.detach().clone())
-                            
-                            # 统一缩放因子检查
-                            inv_scale = 1. / scaler.get_scale()
-                            max_unscaled_grad = max(torch.max(torch.abs(g * inv_scale)) for g in unscaled_grads)
-                            if max_unscaled_grad > 1e4:
-                                logging.warning(f"未缩放梯度过大: {max_unscaled_grad.item():.2f}")
-                                scaler.update(0.5 * scaler.get_scale())  # 主动降低缩放因子
-                                continue
+                                    param.grad.data.mul_(torch.clamp(torch.tensor(1.0 / max(1.0, torch.norm(param.grad.data) / (1000.0 * scale))), max=1.0))
                         
-                        # 在更新权重之前取消缩放梯度
+                        # 只有在梯度有效的情况下才unscale
                         scaler.unscale_(optimizer)
                         
-                        # 梯度裁剪
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), 
-                            max_norm=1.0,
-                            norm_type=2.0,  # 使用L2范数
-                            error_if_nonfinite=True
-                        )
+                        # unscale后再次检查梯度
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                # 检查并处理非法梯度
+                                if torch.isnan(param.grad).any():
+                                    logging.error(f"参数 {name} 中存在NaN梯度，已跳过本批次更新")
+                                    valid_gradients = False
+                                    break
+                                elif torch.isinf(param.grad).any():
+                                    logging.error(f"参数 {name} 中存在Inf梯度，已跳过本批次更新")
+                                    valid_gradients = False
+                                    break
+                                    
+                                # 检查梯度范数
+                                grad_norm = torch.norm(param.grad)
+                                # 降低警告阈值，让更多问题提前暴露
+                                if grad_norm > 1e3:  # 从1e4降低到1e3
+                                    # 如果梯度范数非常大，直接跳过本批次
+                                    if grad_norm > 1e5:
+                                        logging.error(f"参数 {name} 梯度范数极大: {grad_norm:.2f}，跳过本批次")
+                                        valid_gradients = False
+                                        break
+                                    else:
+                                        logging.warning(f"参数 {name} 梯度范数过大: {grad_norm:.2f}")
+                                        
+                                        # 对梯度进行额外的缩放，防止极大值影响训练
+                                        scale_factor = min(1.0, 1e3 / grad_norm)
+                                        param.grad.data.mul_(scale_factor)
                         
+                        if not valid_gradients:
+                            # 放弃本批次更新
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                        
+                        # 梯度裁剪 - 使用动态max_norm值
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+                        
+                        # 额外检查裁剪后的梯度是否合理
+                        max_grad_norm = 0.0
+                        for name, param in model.named_parameters():
+                            if param.grad is not None:
+                                grad_norm = torch.norm(param.grad).item()
+                                max_grad_norm = max(max_grad_norm, grad_norm)
+                        
+                        # 如果最大梯度仍然过大，跳过本次更新
+                        if max_grad_norm > 10.0:
+                            logging.warning(f"裁剪后最大梯度范数仍然过大: {max_grad_norm:.2f}，跳过本批次")
+                            optimizer.zero_grad(set_to_none=True)
+                            continue
+                            
                         # 执行优化器步骤
                         scaler.step(optimizer)
                         scaler.update()
-                        
-                    except RuntimeError as e:
-                        if '非有限梯度值' in str(e):
-                            logging.critical("实时梯度监控发现异常，执行紧急恢复")
-                            # 1. 清除梯度
-                            optimizer.zero_grad(set_to_none=True)
-                            # 2. 重置缩放器
-                            scaler.update(2.**10)  # 重置到较低缩放因子
-                            # 3. 跳过当前批次
-                            continue
-                        else:
-                            raise e
+                        optimizer.zero_grad(set_to_none=True)
+                    
+                    except Exception as e:
+                        logging.error(f"梯度处理出错: {str(e)}")
+                        logging.error(traceback.format_exc())
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     
                     running_loss += loss.item()
                     running_l1_loss += l1_loss.item()
@@ -344,6 +435,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                     writer.add_scalar('Loss/Train/Total', loss.item(), global_step)
                     writer.add_scalar('Loss/Train/L1', l1_loss.item(), global_step)
                     writer.add_scalar('Loss/Train/VGG', vgg_loss.item(), global_step)
+                    
+                    # 记录扰动损失
+                    if hasattr(criterion, 'perturbation_loss'):
+                        writer.add_scalar('Loss/Train/Perturbation', perturbation_loss.item(), global_step)
+                    
                     writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
                     
                     if global_step % 100 == 0:
@@ -417,7 +513,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             
             # 验证阶段
             if val_loader is not None:
-                avg_val_loss = validate_with_chunks(model, val_loader, criterion, device)
+                avg_val_loss = validate_direct(model, val_loader, criterion, device, 
+                                              global_step=global_step, 
+                                              writer=writer)
                 
                 writer.add_scalar('Loss/Val/Total', avg_val_loss, epoch)
                 
@@ -482,65 +580,87 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     return model
 
-def validate_with_chunks(model, val_loader, criterion, device, chunk_size=256):
-    """使用分块处理的验证函数
+def validate_direct(model, val_loader, criterion, device, global_step=0, writer=None):
+    """直接进行验证，不使用分块处理
     
     Args:
         model: 模型
         val_loader: 验证数据加载器
         criterion: 损失函数
         device: 设备
-        chunk_size: 分块大小，默认256x256
+        global_step: 当前全局步数
+        writer: TensorBoard SummaryWriter对象，如果为None则创建新的
     """
     model.eval()
     val_loss = 0.0
     val_l1_loss = 0.0
+    val_perturb_loss = 0.0
     val_batch_count = 0
     
-    with torch.inference_mode():  # 比torch.no_grad()更高效
-        for val_inputs, val_labels in val_loader:
-            try:
-                # 分块处理大分辨率图像
-                chunk_loss = 0.0
-                chunk_l1_loss = 0.0
-                chunks = max(1, min(val_inputs.shape[2] // chunk_size, val_inputs.shape[3] // chunk_size))
+    has_perturbation = hasattr(criterion, 'perturbation_loss')
+    
+    try:
+        with torch.inference_mode():
+            for val_inputs, val_labels in val_loader:
+                val_inputs = val_inputs.to(device, non_blocking=True)
+                val_labels = val_labels.to(device, non_blocking=True)
                 
-                for i in range(chunks):
-                    for j in range(chunks):
-                        h_start = i * val_inputs.shape[2] // chunks
-                        h_end = (i + 1) * val_inputs.shape[2] // chunks
-                        w_start = j * val_inputs.shape[3] // chunks
-                        w_end = (j + 1) * val_inputs.shape[3] // chunks
-                        
-                        chunk_in = val_inputs[:, :, h_start:h_end, w_start:w_end].to(device, non_blocking=True)
-                        chunk_label = val_labels[:, :, h_start:h_end, w_start:w_end].to(device, non_blocking=True)
-                        
-                        with torch.amp.autocast(device_type=device.type, 
-                                            dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16, 
-                                            enabled=True): 
-                            chunk_out = model(chunk_in)
-                            loss = criterion(chunk_out, chunk_label, chunk_in)
-                            l1_loss = criterion.l1(chunk_out, chunk_label)
-                        
-                        # 立即转移数据到CPU并释放内存
-                        chunk_loss += loss.detach().cpu().item()
-                        chunk_l1_loss += l1_loss.detach().cpu().item()
-                        del chunk_in, chunk_label, chunk_out, loss, l1_loss
-                        torch.cuda.empty_cache()
+                with torch.amp.autocast(device_type=device.type, 
+                                     dtype=torch.float16 if device.type == 'cuda' else torch.bfloat16, 
+                                     enabled=True):
+                    outputs = model(val_inputs)
+                    
+                    if has_perturbation:
+                        # 使用的是EnhancedCustomLoss
+                        loss, loss_components = criterion(model, outputs, val_labels, val_inputs)
+                        l1_loss = loss_components['l1_loss']
+                        perturb_loss = loss_components['perturbation_loss']
+                    else:
+                        # 使用的是CustomLoss
+                        loss = criterion(outputs, val_labels, val_inputs)
+                        l1_loss = criterion.l1(outputs, val_labels)
+                        perturb_loss = torch.tensor(0.0, device=device)
                 
-                # 计算平均损失
-                val_loss += chunk_loss / (chunks * chunks)
-                val_l1_loss += chunk_l1_loss / (chunks * chunks)
+                val_loss += loss.item()
+                val_l1_loss += l1_loss.item()
+                if has_perturbation:
+                    val_perturb_loss += perturb_loss.item()
                 val_batch_count += 1
                 
-            except Exception as e:
-                logging.error(f"验证时出错: {str(e)}")
-                continue
+                # 及时清理内存
+                del val_inputs, val_labels, outputs, loss, l1_loss
+                if has_perturbation:
+                    del perturb_loss, loss_components
+                torch.cuda.empty_cache()
+                
+    except Exception as e:
+        logging.error(f"验证时出错: {str(e)}")
+        logging.error(traceback.format_exc())
+        # 继续执行，避免单个错误导致整个训练中断
     
     avg_val_loss = val_loss / val_batch_count if val_batch_count > 0 else float('inf')
     avg_val_l1_loss = val_l1_loss / val_batch_count if val_batch_count > 0 else float('inf')
     
-    logging.info(f"验证结果 - 总损失: {avg_val_loss:.4f}, L1损失: {avg_val_l1_loss:.4f}")
+    # 记录到TensorBoard中的验证损失细节
+    if writer is None:
+        writer = SummaryWriter(os.path.join('runs', 'validation'))
+        needs_close = True
+    else:
+        needs_close = False
+    
+    writer.add_scalar('Loss/Val/Total_Direct', avg_val_loss, global_step)
+    writer.add_scalar('Loss/Val/L1_Direct', avg_val_l1_loss, global_step)
+    
+    if has_perturbation:
+        avg_val_perturb_loss = val_perturb_loss / val_batch_count if val_batch_count > 0 else 0.0
+        writer.add_scalar('Loss/Val/Perturbation_Direct', avg_val_perturb_loss, global_step)
+        logging.info(f'直接验证损失: 总计={avg_val_loss:.4f}, L1={avg_val_l1_loss:.4f}, 扰动={avg_val_perturb_loss:.4f}')
+    else:
+        logging.info(f'直接验证损失: 总计={avg_val_loss:.4f}, L1={avg_val_l1_loss:.4f}')
+    
+    if needs_close:
+        writer.close()
+    
     return avg_val_loss
 
 def estimate_memory_usage(model, image_size, batch_size, is_training=True, optimizer_type='adam'):
@@ -659,39 +779,75 @@ def find_optimal_batch_size(model, image_size, available_memory, start_batch_siz
         logging.error(f"批量大小优化出错: {str(e)}")
         return start_batch_size
 
-def load_dataset(processed_dir, batch_size, num_workers=0):
+def load_dataset(processed_dir, batch_size, num_workers=0, apply_normalization=True):
     """
     加载预处理后的数据集
     
     Args:
-        processed_dir: 预处理数据目录
+        processed_dir: 预处理数据目录 (例如: ./data/processed)
         batch_size: 批次大小
         num_workers: 数据加载的工作进程数
+        apply_normalization: 是否应用数据标准化
     """
-    # 加载训练集
-    train_inputs = np.load(os.path.join(processed_dir, 'train_inputs.npy'), mmap_mode='r')
-    train_labels = np.load(os.path.join(processed_dir, 'train_labels.npy'), mmap_mode='r')
+    # 统计文件路径
+    stats_path = os.path.join(processed_dir, 'train_stats.npy') 
     
-    # 加载验证集
-    val_inputs = np.load(os.path.join(processed_dir, 'val_inputs.npy'), mmap_mode='r')
-    val_labels = np.load(os.path.join(processed_dir, 'val_labels.npy'), mmap_mode='r')
+    # 检查统计文件是否存在，如果需要标准化但文件不存在，则报错退出
+    if apply_normalization and not os.path.exists(stats_path):
+        logging.error(f"错误：需要进行标准化，但未找到数据集统计文件: {stats_path}")
+        logging.error("请先运行 calculate_dataset_stats.py 脚本生成该文件。")
+        raise FileNotFoundError(f"未找到数据集统计文件: {stats_path}")
+    elif not apply_normalization:
+         logging.warning("注意：未启用数据标准化 (apply_normalization=False)。")
+
+    # processed_dir 同时作为数据目录和统计目录传递给 Dataset
+    data_dir = processed_dir
+    stats_dir = processed_dir 
     
-    # 创建数据集
-    train_dataset = torch.utils.data.TensorDataset(
-        torch.from_numpy(train_inputs.copy()).float(),  # 转换为float32
-        torch.from_numpy(train_labels.copy()).float()   # 转换为float32
-    )
-    
-    val_dataset = torch.utils.data.TensorDataset(
-        torch.from_numpy(val_inputs.copy()).float(),    # 转换为float32
-        torch.from_numpy(val_labels.copy()).float()     # 转换为float32
-    )
-    
+    # 创建训练集数据集对象
+    try:
+        logging.info(f"尝试加载训练集...")
+        train_dataset = MmapLiverDataset(
+            data_dir=data_dir,
+            split='train', # <--- 指定加载训练集
+            stats_dir=stats_dir, # <--- 指定统计文件目录
+            transform=None,
+            target_transform=None,
+            apply_normalization=apply_normalization
+        )
+        logging.info(f"训练集加载成功，样本数: {len(train_dataset)}")
+        
+        # 创建验证集数据集对象
+        logging.info(f"尝试加载验证集...")
+        val_dataset = MmapLiverDataset(
+            data_dir=data_dir,
+            split='val', # <--- 指定加载验证集
+            stats_dir=stats_dir, # <--- 指定统计文件目录
+            transform=None,
+            target_transform=None,
+            apply_normalization=apply_normalization # 使用与训练集相同的标准化
+        )
+        logging.info(f"验证集加载成功，样本数: {len(val_dataset)}")
+        
+    except FileNotFoundError as e:
+        logging.error(f"加载数据集文件失败: {e}")
+        logging.error(f"请确保以下文件存在于 '{processed_dir}' 目录中:")
+        logging.error(f"  - train_inputs.npy")
+        logging.error(f"  - train_labels.npy")
+        logging.error(f"  - val_inputs.npy")
+        logging.error(f"  - val_labels.npy")
+        if apply_normalization:
+             logging.error(f"  - train_stats.npy")
+        raise e
+    except Exception as e:
+        logging.error(f"使用 MmapLiverDataset 加载数据集时发生未知错误: {str(e)}")
+        raise e
+
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=False, # 如果需要打乱，设为 True
         num_workers=num_workers,
         pin_memory=False, 
         prefetch_factor=None, 
@@ -711,9 +867,22 @@ def load_dataset(processed_dir, batch_size, num_workers=0):
     return train_loader, val_loader
 
 def main():
+    parser = argparse.ArgumentParser(description='训练模型')
+    parser.add_argument('--loss_type', type=str, default=None, help='损失函数类型')
+    parser.add_argument('--perturb_weight', type=float, default=None, help='扰动损失权重')
+    args = parser.parse_args()
+
     # 读取配置文件
     config = configparser.ConfigParser()
     config.read('config.ini', encoding='utf-8')
+    
+    # 使用命令行参数覆盖配置文件设置
+    loss_type = args.loss_type if args.loss_type is not None else config.get('base', 'loss_type', fallback='standard')
+    perturb_weight = args.perturb_weight if args.perturb_weight is not None else float(config.get('base', 'perturb_weight', fallback='0.1'))
+    
+    # 读取dropout率和优化器类型
+    dropout_rate = float(config.get('base', 'dropout_rate', fallback='0.2'))
+    optimizer_type = config.get('base', 'optimizer_type', fallback='adam')
     
     # 设置日志
     log_dir = config.get('base', 'log_dir')
@@ -722,7 +891,8 @@ def main():
     # 初始化模型
     input_channels = int(config.get('base', 'input_channels'))
     output_channels = int(config.get('base', 'output_channels'))
-    model = Unet(input_channels, output_channels).to(device)
+    model = Unet(input_channels, output_channels, dropout_rate=dropout_rate)
+    model = model.to(device)
     
     # 获取图像尺寸
     image_height = int(config.get('base', 'image_height'))
@@ -742,60 +912,67 @@ def main():
         optimal_batch_size = find_optimal_batch_size(model, image_size, available_memory, initial_batch_size)
         
         if optimal_batch_size != initial_batch_size:
-            logging.warning(f"建议将批量大小从{initial_batch_size}调整为{optimal_batch_size}")
+            logging.warning(f"将批量大小从{initial_batch_size}调整为{optimal_batch_size}")
             if optimal_batch_size < initial_batch_size:
                 logging.warning("当前批量大小可能导致显存溢出")
         
-        batch_size = optimal_batch_size
+        batch_size = initial_batch_size
     else:
         batch_size = int(config.get('base', 'batch_size'))
     
     # 完全禁用多进程加载
     num_workers = 0
     
-    # 加载数据集
+    processed_data_path = config['base']['processed_data_dir']
+
+    # 加载数据集 (假设标准化默认启用)
     train_loader, val_loader = load_dataset(
-        processed_dir=config['base']['processed_data_dir'],
+        processed_dir=processed_data_path, 
         batch_size=batch_size,
-        num_workers=num_workers
+        num_workers=num_workers,
+        apply_normalization=True # 明确启用标准化
     )
     
     # 定义损失函数和优化器
-    criterion = CustomLoss(device=device, 
-        alpha=float(config.get('base', 'alpha'))
-    ).to(device)
-    
-    # 添加学习率调度器
-    initial_learning_rate = float(config.get('base', 'learning_rate'))
-    optimizer = optim.Adam(model.parameters(), lr=initial_learning_rate)
-    
-    # 添加学习率调度器
-    scheduler = None
-    if val_loader is not None:
-        # 使用ReduceLROnPlateau，在验证损失停止改善时降低学习率
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,        # 每次将学习率降低为原来的一半
-            patience=5,        # 5个epoch没有改善就降低学习率
-            verbose=True,
-            min_lr=1e-6,      # 最小学习率
-            eps=1e-8          # 防止混合精度下梯度过小导致的问题
-        )
+    if loss_type == 'perturb':
+        from pert_loss import EnhancedCustomLoss
+        criterion = EnhancedCustomLoss(device, alpha=float(config.get('base', 'alpha', fallback='0.9')), 
+                                      perturb_weight=perturb_weight)
+        logging.info(f"使用增强版损失函数(L1 + VGG + 扰动损失)，扰动权重: {perturb_weight}")
     else:
-        # 如果没有验证集，使用余弦退火调度器
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=int(config.get('base', 'num_epochs')),  # 总epoch数
-            eta_min=1e-6,     # 最小学习率
-            verbose=True
-        )
+        from customLoss import CustomLoss
+        criterion = CustomLoss(device, alpha=float(config.get('base', 'alpha', fallback='0.9')))
+        logging.info("使用标准损失函数(L1 + VGG)")
+    
+    # 添加学习率预热和更严格的学习率衰减策略
+    warmup_epochs = int(config.get('base', 'warmup_epochs', fallback=5))
+    num_epochs = int(config.get('base', 'num_epochs'))
+    initial_learning_rate = float(config.get('base', 'learning_rate'))
+    logging.info(f"初始化优化器，学习率: {initial_learning_rate}")
+    if optimizer_type == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=initial_learning_rate, weight_decay=1e-4)
+    elif optimizer_type == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=initial_learning_rate, weight_decay=1e-3)
+    else:
+        optimizer = optim.SGD(model.parameters(), lr=initial_learning_rate, momentum=0.9, weight_decay=1e-4)
+    
+    def get_lr_lambda(epoch):
+        """学习率调度器函数"""
+        if epoch < warmup_epochs:
+            # 预热期学习率线性增加
+            return float(epoch) / float(max(1, warmup_epochs))
+        else:
+            # 预热后使用余弦退火，最小学习率为初始学习率的1%
+            decay_factor = 0.5 * (1.0 + math.cos(math.pi * (epoch - warmup_epochs) / (num_epochs - warmup_epochs)))
+            return max(0.01, decay_factor)  # 确保学习率不低于初始值的1%
+    
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr_lambda)
+    logging.info(f"已创建学习率调度器: 预热轮数={warmup_epochs}, 总轮数={num_epochs}")
     
     logging.info(f"初始学习率设置为: {initial_learning_rate}")
     
     # 开始训练
     logging.info(f"Starting training on device: {device}")
-    num_epochs = int(config.get('base', 'num_epochs'))
     save_path = os.path.join(config.get('base', 'save_dir'), 'best_model.pth')
 
     train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, save_path, scheduler)

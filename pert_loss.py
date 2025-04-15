@@ -125,7 +125,7 @@ class EnhancedCustomLoss(nn.Module):
             inputs: 模型输入 [B, C, H, W]
             
         Returns:
-            loss: 总损失
+            loss: 总损失和各组件损失的字典，包含total_loss, l1_loss, vgg_loss和perturbation_loss(如果启用)
         """
         # 确保输出经过Sigmoid
         assert output.min() >= 0 and output.max() <= 1, "输出必须经过Sigmoid激活!"
@@ -139,18 +139,32 @@ class EnhancedCustomLoss(nn.Module):
         # 计算基本损失（L1 + VGG）
         basic_loss = self.alpha * l1 + (1 - self.alpha) * vgg
         
+        # 创建损失字典
+        losses = {
+            'l1_loss': l1,
+            'vgg_loss': vgg,
+        }
+        
         # 计算扰动损失
         if self.training and self.perturb_weight > 0:
             perturbation_loss = self.perturbation_loss(model, inputs, output)
             total_loss = basic_loss + self.perturb_weight * perturbation_loss
             
+            # 添加扰动损失到字典
+            losses['perturbation_loss'] = perturbation_loss
+            losses['total_loss'] = total_loss
+            
             logging.debug(f"损失详情: L1={l1.item():.6f}, VGG={vgg.item():.6f}, " 
                          f"扰动={perturbation_loss.item():.6f}, 总计={total_loss.item():.6f}")
             
-            return total_loss
+            return total_loss, losses
         else:
+            losses['total_loss'] = basic_loss
+            losses['perturbation_loss'] = torch.tensor(0.0, device=l1.device)
+            
             logging.debug(f"损失详情: L1={l1.item():.6f}, VGG={vgg.item():.6f}, 总计={basic_loss.item():.6f}")
-            return basic_loss
+            
+            return basic_loss, losses
 
 # 用于测量时间稳定性的函数
 def measure_temporal_instability(frames, motion_vectors=None, alpha=5.0):

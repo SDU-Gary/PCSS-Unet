@@ -205,34 +205,94 @@ class LiverDataset(Dataset):
         return len(self.imgs)
 
 class MmapLiverDataset(Dataset):
-    """使用内存映射的数据集实现"""
-    def __init__(self, data_dir, transform=None, target_transform=None):
+    """使用内存映射的数据集实现，支持通道标准化，区分训练/验证集"""
+    # 默认值，以防万一
+    CHANNEL_MEANS = [0.0, 0.0, 0.0, 0.0]
+    CHANNEL_STDS = [1.0, 1.0, 1.0, 1.0]
+    
+    def __init__(self, data_dir, split='train', stats_dir=None, transform=None, target_transform=None, apply_normalization=True):
         """
         Args:
-            data_dir: 包含inputs.npy和labels.npy的目录路径
+            data_dir: 包含 npy 文件的目录路径 (例如: ./data/processed)
+            split: 数据集划分 ('train' 或 'val')
+            stats_dir: 包含 train_stats.npy 的目录路径 (通常与 data_dir 相同)
             transform: 输入数据的转换
             target_transform: 标签数据的转换
+            apply_normalization: 是否应用通道标准化（默认为True）
         """
-        self.inputs_path = os.path.join(data_dir, 'inputs.npy')
-        self.labels_path = os.path.join(data_dir, 'labels.npy')
+        # 如果未提供 stats_dir，则假定它与 data_dir 相同
+        if stats_dir is None:
+            stats_dir = data_dir
+            
+        # 根据 split 构建文件名
+        self.inputs_path = os.path.join(data_dir, f'{split}_inputs.npy') 
+        self.labels_path = os.path.join(data_dir, f'{split}_labels.npy')
+        self.split = split # 保存 split 信息，方便日志记录
+
+        self.apply_normalization = apply_normalization
         
-        if not os.path.exists(self.inputs_path) or not os.path.exists(self.labels_path):
-            raise FileNotFoundError(f"数据文件不存在。请先运行prepare_dataset.py处理数据。")
+        # 检查数据文件是否存在
+        if not os.path.exists(self.inputs_path):
+             raise FileNotFoundError(f"输入数据文件不存在 ({split} split): {self.inputs_path}")
+        if not os.path.exists(self.labels_path):
+             raise FileNotFoundError(f"标签数据文件不存在 ({split} split): {self.labels_path}")
             
         # 使用内存映射模式加载数据
-        self.inputs = np.load(self.inputs_path, mmap_mode='r')
-        self.labels = np.load(self.labels_path, mmap_mode='r')
-        
+        try:
+            logging.info(f"正在加载 {split} 输入数据: {self.inputs_path}")
+            self.inputs = np.load(self.inputs_path, mmap_mode='r')
+            logging.info(f"正在加载 {split} 标签数据: {self.labels_path}")
+            self.labels = np.load(self.labels_path, mmap_mode='r')
+        except Exception as e:
+            logging.error(f"使用 mmap 加载 NumPy 文件失败 ({split} split): {e}")
+            raise
+
         if self.inputs.shape[0] != self.labels.shape[0]:
-            raise ValueError(f"输入数据和标签数量不匹配: {self.inputs.shape[0]} vs {self.labels.shape[0]}")
+            raise ValueError(f"输入数据 ({self.inputs.shape[0]}) 和标签 ({self.labels.shape[0]}) 数量不匹配 ({split} split)")
             
         self.transform = transform
         self.target_transform = target_transform
         
-        logging.info(f"使用内存映射加载数据集:")
-        logging.info(f"输入形状: {self.inputs.shape}")
-        logging.info(f"标签形状: {self.labels.shape}")
+        # --- 加载数据集统计信息（均值和标准差）---
+        # 无论加载 train 还是 val，都使用 train_stats.npy
+        self.means = torch.tensor(MmapLiverDataset.CHANNEL_MEANS, dtype=torch.float32, device='cpu')
+        self.stds = torch.tensor(MmapLiverDataset.CHANNEL_STDS, dtype=torch.float32, device='cpu')
         
+        if self.apply_normalization:
+            # 统计文件固定为 train_stats.npy
+            stats_path = os.path.join(stats_dir, 'train_stats.npy')
+            logging.info(f"({split} split) 尝试加载统计数据文件: {stats_path} [存在: {os.path.exists(stats_path)}]")
+            
+            stats_loaded = False
+            if os.path.exists(stats_path):
+                try:
+                    stats = np.load(stats_path, allow_pickle=True).item()
+                    # 检查加载的数据是否有效
+                    if 'means' in stats and 'stds' in stats and len(stats['means']) == 4 and len(stats['stds']) == 4:
+                        self.means = torch.tensor(stats['means'], dtype=torch.float32, device='cpu')
+                        self.stds = torch.tensor(stats['stds'], dtype=torch.float32, device='cpu')
+                        logging.info(f"({split} split) 成功加载并应用数据集统计信息: {stats_path}")
+                        stats_loaded = True
+                    else:
+                        logging.warning(f"({split} split) 统计文件 {stats_path} 内容格式不正确，将使用默认值。")
+                except Exception as e:
+                    logging.warning(f"({split} split) 从 {stats_path} 加载统计数据失败: {str(e)}，将使用默认值。")
+            
+            if not stats_loaded:
+                 logging.warning(f"({split} split) 未找到或无法加载有效的统计文件 {stats_path}，将使用默认均值和标准差。")
+                 # 保持使用默认值
+        # --- 统计信息加载结束 ---
+
+        logging.info(f"数据集 ({split} split) 加载完成:")
+        logging.info(f"  输入形状: {self.inputs.shape}")
+        logging.info(f"  标签形状: {self.labels.shape}")
+        if self.apply_normalization:
+            logging.info(f"  将使用以下均值进行标准化: {self.means.cpu().numpy()}")
+            logging.info(f"  将使用以下标准差进行标准化: {self.stds.cpu().numpy()}")
+        else:
+            logging.info("  未启用输入数据标准化。")
+
+    # __getitem__ 和 __len__ 方法保持不变
     def __getitem__(self, index):
         """获取一个数据样本"""
         # 从内存映射数组中读取数据
@@ -243,7 +303,19 @@ class MmapLiverDataset(Dataset):
         input_tensor = torch.from_numpy(input_array)
         label_tensor = torch.from_numpy(label_array)
         
-        # 应用变换
+        # 应用标准化
+        if self.apply_normalization:
+            # 确保stds不为零，加上一个小的epsilon
+            epsilon = 1e-8
+            # 检查 stds 是否包含零或非常接近零的值
+            if torch.any(self.stds <= epsilon):
+                 # 仅在第一次遇到时警告，避免刷屏
+                 if not hasattr(self, '_std_warning_logged'):
+                    logging.warning(f"({self.split} split) 检测到标准差接近零: {self.stds.numpy()}。标准化可能产生无效值。请检查统计数据计算。")
+                    self._std_warning_logged = True # 标记已警告
+            input_tensor = (input_tensor - self.means.view(4, 1, 1)) / (self.stds.view(4, 1, 1) + epsilon)
+        
+        # 应用其他变换
         if self.transform is not None:
             input_tensor = self.transform(input_tensor)
         if self.target_transform is not None:

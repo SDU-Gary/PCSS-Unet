@@ -36,3 +36,6 @@ Thumbs.db
 
 tools/
 *.png
+
+# windsurf rules
+.windsurfrules

@@ -15,48 +15,50 @@ import logging
 '''
 #把常用的2个卷积操作简单封装下
 class DoubleConv(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, dropout_rate=0.2, dilation=1):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_ch, in_ch, 3, padding=1),
             nn.BatchNorm2d(in_ch, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True),  # 使用BatchNorm替代InstanceNorm
             nn.LeakyReLU(0.2, inplace=False),
+            nn.Dropout2d(p=dropout_rate),  # 添加空间dropout提高正则化效果
             
             nn.Conv2d(in_ch, out_ch, 1),  # 1x1卷积改变通道数
             nn.BatchNorm2d(out_ch, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True),
             nn.LeakyReLU(0.2, inplace=False),
+            #nn.Dropout2d(p=dropout_rate/2),  # 添加较小的dropout率在输出层
         )
 
     def forward(self, x):
         return self.conv(x)
 
 class Unet(nn.Module):
-    def __init__(self, in_ch=4, out_ch=1):
+    def __init__(self, in_ch=4, out_ch=1, dropout_rate=0.2):
         super().__init__()
         # 删除原conv1，直接从第二层开始（输入已是16通道）
-        self.conv2 = DoubleConv(16, 32)  # 第二层
+        self.conv2 = DoubleConv(16, 64, dropout_rate)  # 第二层
         self.pool2 = nn.AvgPool2d(2)
         
-        self.conv3 = DoubleConv(32, 64)  # 第三层
+        self.conv3 = DoubleConv(64, 128, dropout_rate, dilation=2)  # 第三层
         self.pool3 = nn.AvgPool2d(2)
         
-        self.conv4 = DoubleConv(64, 128)  # 第四层
+        self.conv4 = DoubleConv(128, 512, dropout_rate, dilation=4)  # 第四层
         self.pool4 = nn.AvgPool2d(2)
         
-        self.conv5 = DoubleConv(128, 256)  # 最深层
+        self.conv5 = DoubleConv(512, 1024, dropout_rate)  # 最深层
         
         # 解码器部分
         self.up6 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv6 = DoubleConv(256, 128)
+        self.conv6 = DoubleConv(1024, 512, dropout_rate)
         
         self.up7 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv7 = DoubleConv(128, 64)
+        self.conv7 = DoubleConv(512, 128, dropout_rate)
         
         self.up8 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv8 = DoubleConv(64, 32)
+        self.conv8 = DoubleConv(128, 64, dropout_rate)
         
         self.up9 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv9 = DoubleConv(32, 16)
+        self.conv9 = DoubleConv(64, 16, dropout_rate/2)  # 较低的dropout率在浅层
         
         self.conv10 = nn.Conv2d(16, 4, 1)  # 最终输出4通道
 
@@ -140,9 +142,10 @@ class Unet(nn.Module):
         up9 = self.conv9(up9)
         c10 = self.conv10(up9)
         
-        c10 = torch.sigmoid(c10)
+        # c10 = torch.sigmoid(c10)
         # 重构输出
         out = self.reconstruct_from_channels(c10)
+        out = torch.sigmoid(out)
         return out
 
 #创建一个不存在的文件夹

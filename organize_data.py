@@ -106,8 +106,8 @@ def replace_exr_files(data_path, scene_path):
 
 if __name__ == "__main__":
     # 设置路径
-    scene_path = "d:/GKY/PCSS-Unet/Train/Bistro"
-    output_path = "d:/GKY/PCSS-Unet/data"
+    scene_path = "./Buddha"
+    output_path = "./data"
     
     # 组织数据集
     organize_dataset(scene_path, output_path, train_ratio=0.8)
